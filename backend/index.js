@@ -39,16 +39,17 @@ app.post('/auth/login/customer', async (req, res) => {
 });
 
 app.post('/auth/login/vendor', async (req, res) => {
-  // Vendors don't have passwords in the current DB schema, so we authenticate by name & phone
-  const { name, phone_number } = req.body;
+  const { email, password } = req.body;
   try {
     const result = await pool.query(
-      `SELECT restaurant_id, name, cuisine_type, phone_number 
-       FROM restaurants WHERE name = $1 AND phone_number = $2`,
-      [name, phone_number]
+      `SELECT v.vendor_id, v.name, v.email, r.restaurant_id
+       FROM vendors v
+       LEFT JOIN restaurants r ON r.vendor_id = v.vendor_id
+       WHERE v.email = $1 AND v.password_hash = $2`,
+      [email, password]
     );
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid name or phone number' });
+      return res.status(401).json({ error: 'Invalid email or password' });
     }
     res.json(result.rows[0]);
   } catch (err) {
@@ -57,18 +58,55 @@ app.post('/auth/login/vendor', async (req, res) => {
   }
 });
 
-app.post('/auth/register/vendor', async (req, res) => {
-  const { name, cuisine_type, phone_number, city, street_address } = req.body;
+// GET all restaurants owned by a specific vendor
+app.get('/vendors/:id/restaurants', async (req, res) => {
   try {
     const result = await pool.query(`
-      INSERT INTO restaurants (name, cuisine_type, phone_number, city, street_address)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING restaurant_id, name, cuisine_type
-    `, [name, cuisine_type, phone_number, city, street_address]);
-    res.status(201).json(result.rows[0]);
+      SELECT restaurant_id, name, cuisine_type, rating, city
+      FROM restaurants 
+      WHERE vendor_id = $1
+    `, [req.params.id]);
+    res.json(result.rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Database error' });
+  }
+});
+
+app.post('/auth/register/vendor', async (req, res) => {
+  const { name, cuisine_type, phone_number, city, street_address, email, password_hash } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    // 1. Create the Vendor Account
+    const vendorRes = await client.query(`
+      INSERT INTO vendors (name, email, phone_number, password_hash)
+      VALUES ($1, $2, $3, $4)
+      RETURNING vendor_id
+    `, [name, email, phone_number, password_hash]);
+    
+    const vendorId = vendorRes.rows[0].vendor_id;
+
+    // 2. Create the Restaurant linked to this Vendor
+    const restRes = await client.query(`
+      INSERT INTO restaurants (name, cuisine_type, phone_number, city, street_address, vendor_id)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING restaurant_id, name
+    `, [name, cuisine_type, phone_number, city, street_address, vendorId]);
+
+    await client.query('COMMIT');
+    res.status(201).json({ 
+      message: 'Vendor and Restaurant created successfully',
+      vendor_id: vendorId,
+      restaurant_id: restRes.rows[0].restaurant_id 
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Vendor registration failed' });
+  } finally {
+    client.release();
   }
 });
 app.get('/health', (req, res) => {
@@ -568,6 +606,28 @@ app.patch('/orders/:id/status', async (req, res) => {
     `, [status, req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// GET all orders for a specific restaurant (Vendor Side)
+app.get('/restaurants/:id/orders', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        o.order_id, o.order_date, o.total_amount, o.status, 
+        o.special_instructions,
+        c.first_name, c.last_name,
+        ca.street, ca.city
+      FROM orders o
+      JOIN customers c ON c.customer_id = o.customer_id
+      LEFT JOIN customer_addresses ca ON ca.address_id = o.delivery_address_id
+      WHERE o.restaurant_id = $1
+      ORDER BY o.order_date DESC
+    `, [req.params.id]);
+    res.json(result.rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Database error' });
